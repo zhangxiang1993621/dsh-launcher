@@ -14,11 +14,15 @@ DeepSeek Harness 启动器
 import glob
 import http.client
 import json
+import math
 import os
 import queue
+import random
 import re
 import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -56,6 +60,79 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 # 单实例互斥量名称
 MUTEX_NAME = "Local\\dsh-launcher-singleton"
+
+# 浏览器标签去重辅助脚本：用 UIAutomation 探测已打开的浏览器标签。
+# 输出 "refresh" = 已找到并刷新；"open" = 未找到，应新开标签。
+BROWSER_DEDUP_PS1 = r'''
+param([string]$url)
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+  Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+} catch {
+  Write-Output 'open'
+  exit 0
+}
+
+$target = ''
+try {
+  $u = [Uri]$url
+  $target = "$($u.Host):$($u.Port)"
+} catch {
+  $target = $url
+}
+
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$classes = @('Chrome_WidgetWin_1', 'MozillaWindowClass')
+
+foreach ($cls in $classes) {
+  $cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ClassNameProperty, $cls)
+  $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+  foreach ($w in $windows) {
+    try {
+      # 1) 当前活动标签页的地址栏 = 目标地址 -> 直接刷新
+      $addrCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'AddressAndSearchBar')
+      $addr = $w.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $addrCond)
+      if ($addr) {
+        $vp = $addr.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        $val = $vp.Current.Value
+        if ($val -and $target -and $val -like "*$target*") {
+          $w.SetFocus()
+          Start-Sleep -Milliseconds 300
+          [System.Windows.Forms.SendKeys]::SendWait('^r')
+          Write-Output 'refresh'
+          exit 0
+        }
+      }
+    } catch {}
+
+    try {
+      # 2) 遍历所有标签页，按标题匹配 DeepSeek Harness -> 选中并刷新
+      $tabCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::TabItem)
+      $tabs = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabCond)
+      foreach ($t in $tabs) {
+        if ($t.Current.Name -like '*DeepSeek Harness*') {
+          $sel = $t.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+          $sel.Select()
+          Start-Sleep -Milliseconds 200
+          $t.SetFocus()
+          Start-Sleep -Milliseconds 200
+          [System.Windows.Forms.SendKeys]::SendWait('^r')
+          Write-Output 'refresh'
+          exit 0
+        }
+      }
+    } catch {}
+  }
+}
+
+Write-Output 'open'
+'''
 
 
 # ---------------- 工具函数 ----------------
@@ -141,26 +218,77 @@ def save_config(cfg):
 # 透明色：宠物窗口里这个颜色的区域会变为透明（仅 Windows 有效）
 PET_TRANSPARENT = "#ff00ff"
 
-# 状态 → 脸的颜色
-PET_FACE_COLORS = {
-    "running": "#9fe8a0",   # 运行中：绿
-    "starting": "#ffe9a8",  # 启动中：黄
-    "busy": "#bcd6ff",      # 更新/重建/构建：蓝
-    "error": "#ffc9c9",     # 失败/超时：红
-    "idle": "#f6e3b4",      # 就绪：奶油色
+# 状态 → 光环颜色
+PET_AURA_COLORS = {
+    "running": "#4cc95c",   # 运行中：绿
+    "starting": "#f0c040",  # 启动中：黄
+    "busy": "#5b9cf5",      # 更新/重建/构建：蓝
+    "error": "#ef5f5f",     # 失败/超时：红
+    "idle": "#e8c98a",      # 就绪：奶油色
 }
 
-PET_SIZE = 84
+# 画布尺寸（顶部留给气泡，底部留给飘动的爱心）
+PET_W, PET_H = 170, 210
+PET_CX, PET_CY = 85, 130      # 宠物图片中心
+PET_IMG_SIZE = 120            # 宠物图片目标显示尺寸
+PET_AURA_R = 62               # 状态光环半径
+
+# 状态 → 气泡文案池
+PET_BUBBLES = {
+    "idle": ["喵～", "在呢在呢", "好无聊呀…", "戳我干嘛 >_<", "要不要启动服务？"],
+    "running": ["服务运行中 ♪", "我在认真干活！", "一切正常喵", "有需要就叫我"],
+    "starting": ["正在启动…", "稍等哦", "马上就好！"],
+    "busy": ["更新中…", "别打扰我干活！", "构建到一半啦"],
+    "error": ["出错了…", "好难过 QAQ", "看看日志吧"],
+}
+PET_FLOAT_TEXTS = ["❤", "♪", "✨", "ฅ^•ﻌ•^ฅ"]
+
+# 贴边收缩：距屏幕边缘多少像素内触发收缩 / 收缩后露出的边宽 / 滑动动画参数
+PET_EDGE_SNAP = 28
+PET_SLIVER = 20
+PET_SLIDE_STEPS = 10
+PET_SLIDE_INTERVAL = 18
+
+
+def asset_path(name):
+    """定位内置素材：PyInstaller 打包后从 _MEIPASS 读取，否则从脚本目录读取。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "assets", name)
 
 
 class DesktopPet:
-    """常驻桌面的小宠物：双击/右键打开面板，右键菜单可启动、停止、更新、退出。"""
+    """常驻桌面宠物：图片形象 + 状态光环 + 待机动画 + 点击互动。
+
+    交互：
+      - 左键单击：跳一下 + 随机气泡 + 爱心/音符飘起
+      - 左键双击：打开面板
+      - 左键拖动：移动（松手记住位置）
+      - 右键：菜单（启动/停止/更新/重建/退出）
+      - 悬停：状态气泡
+    """
 
     def __init__(self, app):
         self.app = app
         self._drag = None
         self._tip = None
         self._face = "idle"
+        self._bob = 0.0            # 待机浮动相位
+        self._jump = 0             # 跳跃剩余帧
+        self._jump_total = 12
+        self._jump_height = 14
+        self._moved = False        # 拖动是否超过阈值
+        self._click_after = None   # 单击互动延时（用于区分双击）
+        self._idle_counter = random.randint(180, 500)
+        self._dead = False
+        self._docked = None        # 贴边状态：None / left / right / top / bottom
+        self._resting = None       # 收缩前的完整位置 (x, y)
+        self._slide_cb = None      # 滑动动画的 after 句柄
+        self._img = None
+        self._heart_img = None
+        self._img_item = None
+        self._aura_item = None
+        self._bubble_items = []
+        self._float_items = []
 
         self.win = tk.Toplevel(app.root)
         self.win.overrideredirect(True)
@@ -171,18 +299,20 @@ class DesktopPet:
             pass
         self.win.configure(bg=PET_TRANSPARENT)
 
-        self.canvas = tk.Canvas(self.win, width=PET_SIZE, height=PET_SIZE,
+        self.canvas = tk.Canvas(self.win, width=PET_W, height=PET_H,
                                 bg=PET_TRANSPARENT, highlightthickness=0, bd=0)
         self.canvas.pack()
+
+        self._load_images()
         self._draw()
 
         # 交互
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Double-Button-1>", lambda e: self.open_panel())
+        self.canvas.bind("<Double-Button-1>", self._on_double)
         self.canvas.bind("<Button-3>", self._show_menu)
-        self.canvas.bind("<Enter>", self._show_tip)
+        self.canvas.bind("<Enter>", self._on_enter)
         self.canvas.bind("<Leave>", self._hide_tip)
 
         # 初始位置：上次保存的位置，或屏幕右下角
@@ -193,32 +323,66 @@ class DesktopPet:
         else:
             sw = self.win.winfo_screenwidth()
             sh = self.win.winfo_screenheight()
-            self.win.geometry("+%d+%d" % (sw - PET_SIZE - 24, sh - PET_SIZE - 120))
+            self.win.geometry("+%d+%d" % (sw - PET_W - 24, sh - PET_H - 80))
+
+        # 动画循环
+        self._tick_after = self.win.after(60, self._tick)
+
+    # ---------- 素材 ----------
+    def _load_images(self):
+        def load(name, target):
+            try:
+                p = asset_path(name)
+                if not os.path.isfile(p):
+                    return None
+                img = tk.PhotoImage(file=p)
+                w, h = img.width(), img.height()
+                if w >= target:
+                    return img.subsample(max(1, w // target), max(1, h // target))
+                k = max(1, target // max(w, 1))
+                return img.zoom(k, k)
+            except tk.TclError:
+                return None
+        self._img = load("pet.png", PET_IMG_SIZE)
+        self._heart_img = load("heart.png", 22)
 
     # ---------- 绘制 ----------
     def _draw(self):
-        self.canvas.delete("all")
         c = self.canvas
-        head = PET_FACE_COLORS.get(self._face, PET_FACE_COLORS["idle"])
-        dark = "#5b4636"
-        # 耳朵（猫）
-        c.create_polygon(14, 30, 26, 6, 38, 22, fill=head, outline=dark, width=2)
-        c.create_polygon(46, 22, 58, 6, 70, 30, fill=head, outline=dark, width=2)
-        # 头
-        c.create_oval(8, 16, 76, 78, fill=head, outline=dark, width=2)
-        # 眼睛
-        c.create_oval(26, 38, 38, 50, fill=dark)
-        c.create_oval(46, 38, 58, 50, fill=dark)
-        c.create_oval(30, 40, 34, 44, fill="#ffffff")
-        c.create_oval(50, 40, 54, 44, fill="#ffffff")
-        # 腮红
-        c.create_oval(12, 52, 22, 60, fill="#ffd9d9", outline="")
-        c.create_oval(62, 52, 72, 60, fill="#ffd9d9", outline="")
-        # 嘴
-        c.create_arc(36, 52, 48, 64, start=0, extent=180, style="arc", outline=dark, width=2)
+        c.delete("all")
+        aura = PET_AURA_COLORS.get(self._face, PET_AURA_COLORS["idle"])
+        self._aura_item = c.create_oval(
+            PET_CX - PET_AURA_R, PET_CY - PET_AURA_R,
+            PET_CX + PET_AURA_R, PET_CY + PET_AURA_R,
+            outline=aura, width=7)
+        if self._img is not None:
+            self._img_item = c.create_image(PET_CX, PET_CY, image=self._img)
+        else:
+            self._draw_fallback_cat()
 
+    def _draw_fallback_cat(self):
+        """无素材时的兜底手绘猫。"""
+        c = self.canvas
+        head = PET_AURA_COLORS.get(self._face, PET_AURA_COLORS["idle"])
+        dark = "#5b4636"
+        ox, oy = PET_CX - 42, PET_CY - 42
+        c.create_polygon(ox + 6, oy + 14, ox + 18, oy - 10, ox + 30, oy + 6,
+                         fill=head, outline=dark, width=2)
+        c.create_polygon(ox + 38, oy + 6, ox + 50, oy - 10, ox + 62, oy + 14,
+                         fill=head, outline=dark, width=2)
+        c.create_oval(ox, oy, ox + 68, oy + 62, fill=head, outline=dark, width=2)
+        c.create_oval(ox + 18, oy + 22, ox + 30, oy + 34, fill=dark)
+        c.create_oval(ox + 38, oy + 22, ox + 50, oy + 34, fill=dark)
+        c.create_oval(ox + 22, oy + 24, ox + 26, oy + 28, fill="#ffffff")
+        c.create_oval(ox + 42, oy + 24, ox + 46, oy + 28, fill="#ffffff")
+        c.create_oval(ox + 4, oy + 36, ox + 14, oy + 44, fill="#ffd9d9", outline="")
+        c.create_oval(ox + 54, oy + 36, ox + 64, oy + 44, fill="#ffd9d9", outline="")
+        c.create_arc(ox + 28, oy + 36, ox + 40, oy + 48, start=0, extent=180,
+                     style="arc", outline=dark, width=2)
+
+    # ---------- 状态联动 ----------
     def reflect(self, status_text):
-        """根据状态栏文字切换脸的颜色与悬浮提示。"""
+        """根据状态栏文字切换光环颜色、宠物表情与提示气泡。"""
         if "运行中" in status_text:
             face = "running"
         elif "启动" in status_text:
@@ -233,8 +397,259 @@ class DesktopPet:
         if face != self._face:
             self._face = face
             self._draw()
+            if face in ("running", "error") and not self._dead:
+                self._bubble(random.choice(PET_BUBBLES[face]))
+                if face == "running":
+                    self._float_text(random.choice(PET_FLOAT_TEXTS))
         if self._tip is not None and self._tip.winfo_exists():
             self._tip_label.configure(text=status_text)
+
+    # ---------- 动画 ----------
+    def _tick(self):
+        if self._dead:
+            return
+        try:
+            c = self.canvas
+            self._bob += 0.12
+            dy = int(3 * math.sin(self._bob))
+            # 跳跃叠加
+            if self._jump > 0:
+                self._jump -= 1
+                progress = 1.0 - self._jump / self._jump_total
+                dy += int(math.sin(progress * math.pi) * self._jump_height)
+            if self._img_item is not None:
+                c.coords(self._img_item, PET_CX, PET_CY + dy)
+            if self._aura_item is not None:
+                c.coords(self._aura_item,
+                         PET_CX - PET_AURA_R, PET_CY - PET_AURA_R + dy,
+                         PET_CX + PET_AURA_R, PET_CY + PET_AURA_R + dy)
+            # 飘动元素上浮
+            for item in list(self._float_items):
+                c.move(item, 0, -2)
+                box = c.bbox(item)
+                if box is None or box[1] < 2:
+                    c.delete(item)
+                    self._float_items.remove(item)
+            # 随机待机互动（约 11-30 秒一次）
+            self._idle_counter -= 1
+            if self._idle_counter <= 0 and not self._drag:
+                self._idle_counter = random.randint(180, 500)
+                if random.random() < 0.55:
+                    self._bubble(random.choice(PET_BUBBLES.get(self._face, PET_BUBBLES["idle"])))
+                else:
+                    self._jump_start(10)
+        except tk.TclError:
+            return
+        self._tick_after = self.win.after(60, self._tick)
+
+    def _jump_start(self, height=None):
+        self._jump_total = 12
+        self._jump = self._jump_total
+        self._jump_height = height or 14
+
+    # ---------- 互动 ----------
+    def _bubble(self, text):
+        """在宠物头顶显示气泡，2.6 秒后消失。"""
+        if self._dead or not text:
+            return
+        try:
+            c = self.canvas
+            self._clear_bubble()
+            w, h = 124, 26
+            x, y = PET_CX - w / 2, 12
+            items = [
+                c.create_oval(x, y, x + w, y + h, fill="#ffffff",
+                              outline="#e0e0e0", width=1),
+                c.create_polygon(PET_CX - 9, y + h - 1, PET_CX, y + h + 10,
+                                 PET_CX + 9, y + h - 1, fill="#ffffff", outline=""),
+            ]
+            display = text if len(text) <= 12 else text[:12] + "…"
+            items.append(c.create_text(x + w / 2, y + h / 2, text=display, fill="#333333",
+                                       font=("Microsoft YaHei UI", 9, "bold")))
+            self._bubble_items = items
+            self.win.after(2600, self._clear_bubble)
+        except tk.TclError:
+            pass
+
+    def _clear_bubble(self):
+        try:
+            for item in self._bubble_items:
+                self.canvas.delete(item)
+        except tk.TclError:
+            pass
+        self._bubble_items = []
+
+    def _float_text(self, text):
+        """从宠物旁边飘起一个表情/爱心。"""
+        if self._dead:
+            return
+        try:
+            c = self.canvas
+            if self._heart_img is not None and text == "❤":
+                self._float_items.append(c.create_image(PET_CX + 40, PET_CY + 50,
+                                                        image=self._heart_img))
+            self._float_items.append(c.create_text(
+                PET_CX + random.randint(-46, 46), PET_CY + 52, text=text,
+                fill="#e05588", font=("Segoe UI Emoji", 11, "bold")))
+            while len(self._float_items) > 8:
+                c.delete(self._float_items.pop(0))
+        except tk.TclError:
+            pass
+
+    # ---------- 鼠标事件 ----------
+    def _on_press(self, event):
+        self._drag = (event.x_root - self.win.winfo_x(),
+                      event.y_root - self.win.winfo_y())
+        self._moved = False
+        if self._click_after is not None:
+            try:
+                self.win.after_cancel(self._click_after)
+            except tk.TclError:
+                pass
+            self._click_after = None
+
+    def _on_drag(self, event):
+        if self._drag:
+            nx = event.x_root - self._drag[0]
+            ny = event.y_root - self._drag[1]
+            if abs(nx - self.win.winfo_x()) > 5 or abs(ny - self.win.winfo_y()) > 5:
+                self._moved = True
+            self.win.geometry("+%d+%d" % (nx, ny))
+
+    def _on_release(self, _event):
+        if self._drag:
+            self._drag = None
+            if self._moved:
+                if not self._maybe_dock():
+                    self.app._save_settings()  # 记住新位置（贴边时已在 _maybe_dock 内处理）
+            elif self._click_after is None:
+                # 单击 → 延时触发互动（若随后出现双击则取消）
+                self._click_after = self.win.after(260, self._react)
+
+    def _on_double(self, _event):
+        if self._click_after is not None:
+            try:
+                self.win.after_cancel(self._click_after)
+            except tk.TclError:
+                pass
+            self._click_after = None
+        self.open_panel()
+
+    def _react(self):
+        """单击互动：跳一下 + 气泡 + 飘爱心。"""
+        self._click_after = None
+        if self._dead:
+            return
+        self._jump_start()
+        self._float_text(random.choice(PET_FLOAT_TEXTS))
+        pool = PET_BUBBLES.get(self._face, PET_BUBBLES["idle"])
+        self._bubble(random.choice(pool))
+
+    # ---------- 贴边收缩 ----------
+    @staticmethod
+    def _screen_bounds():
+        """返回虚拟屏幕边界 (x0, y0, x1, y1)，支持多显示器；失败时按主屏近似。"""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            x = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+            y = user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+            w = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+            h = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+            if w > 0 and h > 0:
+                return (x, y, x + w, y + h)
+        except Exception:
+            pass
+        return (0, 0, 0, 0)  # 调用方检测到 0 会回退主屏
+
+    def _screen_bounds_fallback(self):
+        try:
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            x0 = min(0, self.win.winfo_x())
+            y0 = min(0, self.win.winfo_y())
+            return (x0, y0, x0 + sw, y0 + sh)
+        except tk.TclError:
+            return (0, 0, 1920, 1080)
+
+    def _slide_to(self, tx, ty, steps=PET_SLIDE_STEPS, interval=PET_SLIDE_INTERVAL):
+        """把窗口平滑移动到目标位置。"""
+        if self._dead:
+            return
+        try:
+            x0, y0 = self.win.winfo_x(), self.win.winfo_y()
+
+            def step(i):
+                if self._dead:
+                    return
+                k = (i + 1) / steps
+                self.win.geometry("+%d+%d" % (int(x0 + (tx - x0) * k),
+                                              int(y0 + (ty - y0) * k)))
+                if i + 1 < steps:
+                    self._slide_cb = self.win.after(interval, lambda: step(i + 1))
+
+            step(0)
+        except tk.TclError:
+            pass
+
+    def _maybe_dock(self):
+        """拖动松手后检测是否贴近屏幕边缘：是则滑入收缩，返回 True。"""
+        try:
+            x, y = self.win.winfo_x(), self.win.winfo_y()
+            w, h = PET_W, PET_H
+            bx, by, bx1, by1 = self._screen_bounds()
+            if bx1 - bx <= 0 or by1 - by <= 0:
+                bx, by, bx1, by1 = self._screen_bounds_fallback()
+            right, bottom = x + w, y + h
+            d = {"right": abs(right - bx1), "left": abs(x - bx),
+                 "bottom": abs(bottom - by1), "top": abs(y - by)}
+            edge = min(d, key=d.get)
+            if d[edge] > PET_EDGE_SNAP:
+                self._docked = None
+                self._resting = None
+                return False
+            # 收缩目标：让露出的一小条正好切在宠物身体上（对准画布中心 PET_CX/PET_CY）
+            if edge == "right":
+                tx, ty = bx1 - PET_SLIVER - PET_CX, y
+            elif edge == "left":
+                tx, ty = bx - PET_CX + PET_SLIVER, y
+            elif edge == "bottom":
+                tx, ty = x, by1 - PET_SLIVER - PET_CY
+            else:
+                tx, ty = x, by - PET_CY + PET_SLIVER
+            self._docked = edge
+            self._resting = (x, y)
+            self._slide_to(tx, ty)
+            return True
+        except tk.TclError:
+            return False
+
+    def _undock(self):
+        """从收缩状态滑回完整位置。"""
+        if not self._docked:
+            return
+        try:
+            rx, ry = self._resting or (self.win.winfo_x(), self.win.winfo_y())
+            self._slide_to(rx, ry)
+        except tk.TclError:
+            pass
+        self._docked = None
+        self._resting = None
+
+    def _on_enter(self, event=None):
+        """鼠标移入：先滑出（若贴边），再显示状态提示。"""
+        if self._docked:
+            self._undock()
+        self._show_tip(event)
+
+    def position(self):
+        """返回应保存的位置：贴边时保存完整（滑出后）的位置。"""
+        if self._docked and self._resting:
+            return self._resting
+        try:
+            return (self.win.winfo_x(), self.win.winfo_y())
+        except tk.TclError:
+            return (0, 0)
 
     # ---------- 显示 / 隐藏 ----------
     def show(self):
@@ -245,26 +660,21 @@ class DesktopPet:
         self.win.withdraw()
 
     def destroy(self):
+        self._dead = True
         self._hide_tip()
+        try:
+            self.win.after_cancel(self._tick_after)
+        except (tk.TclError, AttributeError):
+            pass
+        if self._slide_cb is not None:
+            try:
+                self.win.after_cancel(self._slide_cb)
+            except tk.TclError:
+                pass
         self.win.destroy()
 
     def open_panel(self):
         self.app._show_panel()
-
-    # ---------- 拖动 ----------
-    def _on_press(self, event):
-        self._drag = (event.x_root - self.win.winfo_x(),
-                      event.y_root - self.win.winfo_y())
-
-    def _on_drag(self, event):
-        if self._drag:
-            self.win.geometry("+%d+%d" % (event.x_root - self._drag[0],
-                                          event.y_root - self._drag[1]))
-
-    def _on_release(self, _event):
-        if self._drag:
-            self._drag = None
-            self.app._save_settings()  # 记住新位置
 
     # ---------- 悬浮提示 ----------
     def _show_tip(self, _event=None):
@@ -279,8 +689,18 @@ class DesktopPet:
                                            padx=6, pady=2)
                 self._tip_label.pack()
             self._tip_label.configure(text=self.app.status_var.get())
-            x = self.win.winfo_x() + PET_SIZE // 2
-            y = self.win.winfo_y() - 26
+            # 先重新排版再测量实际宽度，把提示框水平居中到宠物中心上方
+            self._tip.update_idletasks()
+            tw = self._tip.winfo_reqwidth()
+            th = self._tip.winfo_reqheight()
+            x = self.win.winfo_x() + (PET_W - tw) // 2
+            y = self.win.winfo_y() - th - 6
+            # 屏幕边缘钳制，避免提示框跑到屏幕外
+            sw = self.win.winfo_screenwidth()
+            if x < 0:
+                x = 0
+            elif x + tw > sw:
+                x = sw - tw
             self._tip.geometry("+%d+%d" % (x, y))
             self._tip.deiconify()
         except tk.TclError:
@@ -553,6 +973,16 @@ class LauncherApp:
         except Exception as exc:
             self._append_log("[错误] 停止进程失败：%s" % exc)
 
+    def _kill_process(self, pid):
+        """只结束单个进程（不带 /T，避免误杀占用者的子进程）。"""
+        try:
+            subprocess.run([TASKKILL_EXE, "/F", "/PID", str(pid)],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           creationflags=CREATE_NO_WINDOW)
+        except Exception as exc:
+            self._append_log("[错误] 结束进程失败：%s" % exc)
+
     @staticmethod
     def _port_open(host, port):
         """仅探测 TCP 端口是否在监听（用于启动前的占用检查）。"""
@@ -561,6 +991,39 @@ class LauncherApp:
                 return True
         except OSError:
             return False
+
+    def _port_occupier(self, port):
+        """返回占用端口的进程信息 (pid, name, path)；未占用或查询失败返回 None。"""
+        pid = None
+        try:
+            r = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                               capture_output=True, text=True,
+                               timeout=15, creationflags=CREATE_NO_WINDOW)
+            needle = ":%d " % port
+            for line in (r.stdout or "").splitlines():
+                if "LISTENING" in line and needle in line:
+                    parts = line.split()
+                    if parts and parts[-1].isdigit():
+                        pid = int(parts[-1])
+                        break
+        except Exception:
+            pass
+        if pid is None:
+            return None
+        name, path = "未知进程", ""
+        try:
+            ps = ('powershell -NoProfile -ExecutionPolicy Bypass -Command '
+                  '"Get-Process -Id %d -ErrorAction SilentlyContinue | '
+                  'ForEach-Object { $_.ProcessName + \'|\' + $_.Path }"' % pid)
+            r = subprocess.run(ps, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               timeout=10, creationflags=CREATE_NO_WINDOW)
+            out = (r.stdout or "").strip()
+            if "|" in out:
+                name, _, path = out.partition("|")
+        except Exception:
+            pass
+        return pid, name or "未知进程", path or ""
 
     @staticmethod
     def _http_ready(host, port, timeout=1):
@@ -639,9 +1102,22 @@ class LauncherApp:
         if port is None or repo is None:
             return
         if self._port_open("127.0.0.1", port):
-            if not messagebox.askyesno("端口已占用",
-                                       "端口 %d 似乎已被其他程序占用，仍要启动吗？" % port):
+            info = self._port_occupier(port)
+            if info:
+                pid, name, path = info
+                msg = ("端口 %d 已被以下进程占用：\n\n"
+                       "  进程：%s (PID %d)\n"
+                       "  路径：%s\n\n"
+                       "是否结束该进程并启动服务？\n"
+                       "（选择“否”则取消启动）" % (port, name, pid, path or "未知"))
+            else:
+                msg = ("端口 %d 似乎已被其他程序占用，仍要启动吗？" % port)
+            if not messagebox.askyesno("端口已占用", msg):
                 return
+            if info:
+                self._append_log("正在结束占用进程 %s (PID %d)…" % (name, pid))
+                self._kill_process(pid)
+                time.sleep(0.5)
         self._save_settings()
         self._set_running(True)
         self.status_var.set("正在启动（端口 %d）…" % port)
@@ -695,10 +1171,7 @@ class LauncherApp:
             self._append_log("服务已就绪：%s" % url)
             self._ui(self.status_var.set, "运行中（端口 %d）" % port)
             if auto_open:
-                try:
-                    webbrowser.open(url)
-                except Exception as exc:
-                    self._append_log("[提示] 自动打开浏览器失败：%s" % exc)
+                self._open_browser(url)
         elif proc.poll() is not None:
             self._append_log("[提示] 服务进程提前退出，请查看上方日志。")
             self._ui(self.status_var.set, "启动失败")
@@ -710,6 +1183,34 @@ class LauncherApp:
         else:
             self._append_log("[提示] 等待服务就绪超时（%s 秒），请检查日志。" % READY_TIMEOUT)
             self._ui(self.status_var.set, "启动超时")
+
+    # ---------- 打开浏览器（避免重复标签） ----------
+    def _open_browser(self, url):
+        """打开浏览器但避免重复标签：已存在该页面的标签则刷新，否则新开。"""
+        try:
+            if self._try_refresh_browser_tab(url):
+                self._append_log("已在浏览器中找到该页面，已刷新标签。")
+                return
+        except Exception as exc:
+            self._append_log("[提示] 浏览器标签检测失败，改用常规方式打开：%s" % exc)
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            self._append_log("[提示] 自动打开浏览器失败：%s" % exc)
+
+    def _try_refresh_browser_tab(self, url):
+        """用 UIAutomation 探测浏览器：找到目标标签则刷新并返回 True。"""
+        ps1 = os.path.join(tempfile.gettempdir(), "dsh_browser_dedup.ps1")
+        with open(ps1, "w", encoding="utf-8-sig") as f:
+            f.write(BROWSER_DEDUP_PS1)
+        powershell = os.path.join(SYSTEM32, "WindowsPowerShell", "v1.0", "powershell.exe")
+        proc = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", ps1, "-url", url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, creationflags=CREATE_NO_WINDOW)
+        out = (proc.stdout or "").strip()
+        return out == "refresh"
 
     def _read_stdout(self, proc):
         try:
@@ -1018,8 +1519,9 @@ class LauncherApp:
         cfg["pet_enabled"] = bool(self.pet_enabled_var.get())
         if hasattr(self, "pet"):
             try:
-                cfg["pet_x"] = self.pet.win.winfo_x()
-                cfg["pet_y"] = self.pet.win.winfo_y()
+                px, py = self.pet.position()
+                cfg["pet_x"] = px
+                cfg["pet_y"] = py
             except tk.TclError:
                 pass
         try:

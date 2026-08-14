@@ -25,10 +25,14 @@ python dsh_launcher.py
 ## 打包
 
 ```bash
+# 一键打包（推荐）：自动定位 PyInstaller，产物 dist\dsh-launcher.exe
+build.bat
+
+# 或手动执行
 pyinstaller --noconfirm dsh-launcher.spec
 ```
 
-spec 已基于当前 Python 环境自动推导 tcl/tk 路径（可移植），exe 带 1.1.0 版本信息。
+spec 已基于当前 Python 环境自动推导 tcl/tk 路径（可移植），exe 带 1.1.0 版本信息，`assets/`（桌面宠物素材）会一并打包。
 
 ## 依赖环境
 
