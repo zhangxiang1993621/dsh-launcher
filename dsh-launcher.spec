@@ -10,15 +10,42 @@ _bin_dir = os.path.join(_base, "Library", "bin")
 
 
 def _collect_tk():
+    """收集 Tcl/Tk 数据到 PyInstaller rthook 期望的 _tcl_data/_tk_data。
+
+    注意：不能用 'tcl8.6'/'tk8.6' 作为目标目录名——pyi_rth__tkinter.py
+    固定从 sys._MEIPASS/_tcl_data 和 _tk_data 读取（TCL_ROOTNAME/TK_ROOTNAME）。
+    PyInstaller 自带 tcltk_info 的收集依赖环境缓存，不稳定，这里手动兜底。
+    """
     binaries, datas = [], []
     for dll in ("tcl86t.dll", "tk86t.dll", "zlib.dll"):
         p = os.path.join(_bin_dir, dll)
         if os.path.isfile(p):
             binaries.append((p, "."))
-    for name in ("tcl8.6", "tk8.6"):
-        d = os.path.join(_lib_dir, name)
-        if os.path.isdir(d):
-            datas.append((d, name))
+    # tcl 脚本目录 -> _tcl_data；tk 脚本目录 -> _tk_data
+    # 注意：PyInstaller datas 元组 (src, dest_dir) 会自动在 dest_dir 后追加 src 的
+    # basename，所以 dest 只需给到目录级（子目录用 rel 的 dirname）。
+    tcl_d = os.path.join(_lib_dir, "tcl8.6")
+    if os.path.isdir(tcl_d):
+        for root, dirs, files in os.walk(tcl_d):
+            dirs[:] = [d for d in dirs if d not in ("demos", "nmake", "pkgconfig", "cmake")]
+            for f in files:
+                if f.endswith((".lib", "tclConfig.sh")):
+                    continue
+                src = os.path.join(root, f)
+                rel = os.path.relpath(src, tcl_d)
+                dest = os.path.join("_tcl_data", os.path.dirname(rel))
+                datas.append((src, dest))
+    tk_d = os.path.join(_lib_dir, "tk8.6")
+    if os.path.isdir(tk_d):
+        for root, dirs, files in os.walk(tk_d):
+            dirs[:] = [d for d in dirs if d not in ("demos", "nmake", "pkgconfig", "cmake")]
+            for f in files:
+                if f.endswith((".lib", "tkConfig.sh")):
+                    continue
+                src = os.path.join(root, f)
+                rel = os.path.relpath(src, tk_d)
+                dest = os.path.join("_tk_data", os.path.dirname(rel))
+                datas.append((src, dest))
     return binaries, datas
 
 
@@ -117,7 +144,7 @@ a = Analysis(
     binaries=_tk_binaries + _extra_binaries,
     datas=_tk_datas + [(_assets_dir, 'assets')],
     hiddenimports=['pystray', 'PIL'],
-    hookspath=[],
+    hookspath=[os.path.join(SPECPATH, 'hooks')],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
