@@ -24,6 +24,23 @@ def _collect_tk():
 
 _tk_binaries, _tk_datas = _collect_tk()
 
+
+def _collect_conda_dlls():
+    """收集 conda 环境的系统 DLL（PyInstaller 依赖分析常漏掉 Library\\bin 下的文件）。
+
+    ffi.dll 是 _ctypes 的依赖，缺失会导致 import ctypes 失败（托盘图标/单实例失效）；
+    ssl/crypto/expat 是 _ssl/_hashlib/pyexpat 的依赖，一并补齐避免隐性崩溃。
+    """
+    out = []
+    for dll in ("ffi.dll", "libcrypto-3-x64.dll", "libssl-3-x64.dll", "libexpat.dll"):
+        p = os.path.join(_bin_dir, dll)
+        if os.path.isfile(p):
+            out.append((p, "."))
+    return out
+
+
+_extra_binaries = _collect_conda_dlls()
+
 # ---- 版本与构建号：输出 dsh-launcher-1.1.0-<构建号>.exe，构建号每次打包自增 ----
 _VERSION = (1, 1, 0, 0)
 _VERSION_STR = "1.1.0"
@@ -97,7 +114,7 @@ _assets_dir = os.path.join(SPECPATH, 'assets')
 a = Analysis(
     ['dsh_launcher.py'],
     pathex=[],
-    binaries=_tk_binaries,
+    binaries=_tk_binaries + _extra_binaries,
     datas=_tk_datas + [(_assets_dir, 'assets')],
     hiddenimports=['pystray', 'PIL'],
     hookspath=[],
