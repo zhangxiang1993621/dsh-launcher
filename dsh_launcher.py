@@ -245,7 +245,7 @@ PET_FLOAT_TEXTS = ["❤", "♪", "✨", "ฅ^•ﻌ•^ฅ"]
 
 # 贴边收缩：距屏幕边缘多少像素内触发收缩 / 收缩后露出的边宽 / 滑动动画参数
 PET_EDGE_SNAP = 28
-PET_SLIVER = 20
+PET_SLIVER = 36
 PET_SLIDE_STEPS = 10
 PET_SLIDE_INTERVAL = 18
 
@@ -315,18 +315,33 @@ class DesktopPet:
         self.canvas.bind("<Enter>", self._on_enter)
         self.canvas.bind("<Leave>", self._hide_tip)
 
-        # 初始位置：上次保存的位置，或屏幕右下角
+        # 初始位置：上次保存的位置（需校验在屏幕内），否则右下角
         cfg = app.cfg
         x, y = cfg.get("pet_x"), cfg.get("pet_y")
-        if isinstance(x, int) and isinstance(y, int):
-            self.win.geometry("+%d+%d" % (x, y))
-        else:
+        if not (isinstance(x, int) and isinstance(y, int)):
+            x, y = None, None
+        if x is not None and y is not None and not self._position_visible(x, y):
+            self.app._append_log("[提示] 上次宠物位置在屏幕外，已恢复到默认位置。")
+            x, y = None, None
+        if x is None or y is None:
             sw = self.win.winfo_screenwidth()
             sh = self.win.winfo_screenheight()
-            self.win.geometry("+%d+%d" % (sw - PET_W - 24, sh - PET_H - 80))
+            x, y = sw - PET_W - 24, sh - PET_H - 80
+        self.win.geometry("+%d+%d" % (x, y))
 
         # 动画循环
         self._tick_after = self.win.after(60, self._tick)
+
+    def _position_visible(self, x, y):
+        """宠物中心是否在屏幕内（防止配置了屏幕外位置导致宠物“消失”）。"""
+        try:
+            bx, by, bx1, by1 = self._screen_bounds()
+            if bx1 - bx <= 0 or by1 - by <= 0:
+                bx, by, bx1, by1 = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+            cx, cy = x + PET_CX, y + PET_CY
+            return bx < cx < bx1 and by < cy < by1
+        except tk.TclError:
+            return False
 
     # ---------- 素材 ----------
     def _load_images(self):
@@ -643,13 +658,16 @@ class DesktopPet:
         self._show_tip(event)
 
     def position(self):
-        """返回应保存的位置：贴边时保存完整（滑出后）的位置。"""
+        """返回应保存的位置：贴边时保存完整（滑出后）的位置；屏幕外返回 None（不落盘）。"""
         if self._docked and self._resting:
             return self._resting
         try:
-            return (self.win.winfo_x(), self.win.winfo_y())
+            x, y = self.win.winfo_x(), self.win.winfo_y()
+            if not self._position_visible(x, y):
+                return None
+            return (x, y)
         except tk.TclError:
-            return (0, 0)
+            return None
 
     # ---------- 显示 / 隐藏 ----------
     def show(self):
@@ -1519,9 +1537,9 @@ class LauncherApp:
         cfg["pet_enabled"] = bool(self.pet_enabled_var.get())
         if hasattr(self, "pet"):
             try:
-                px, py = self.pet.position()
-                cfg["pet_x"] = px
-                cfg["pet_y"] = py
+                pos = self.pet.position()
+                if pos is not None:
+                    cfg["pet_x"], cfg["pet_y"] = pos
             except tk.TclError:
                 pass
         try:
