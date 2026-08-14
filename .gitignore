@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller 构建产物（build/ 中间产物、dist/ 打包输出）
+build/
+dist/
+
+# 本地配置文件
+*.local
+
+# IDE
+.idea/
+.vscode/
