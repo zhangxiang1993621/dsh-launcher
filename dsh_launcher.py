@@ -1023,12 +1023,15 @@ class LauncherApp:
             self._append_log("[错误] 停止进程失败：%s" % exc)
 
     def _kill_process(self, pid):
-        """只结束单个进程（不带 /T，避免误杀占用者的子进程）。"""
+        """结束进程及其子进程树（/T /F），确保端口能真正释放。"""
         try:
-            subprocess.run([TASKKILL_EXE, "/F", "/PID", str(pid)],
-                           capture_output=True, text=True,
-                           encoding="utf-8", errors="replace",
-                           creationflags=CREATE_NO_WINDOW)
+            r = subprocess.run([TASKKILL_EXE, "/F", "/T", "/PID", str(pid)],
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               creationflags=CREATE_NO_WINDOW)
+            out = (r.stdout or "").strip() or (r.stderr or "").strip()
+            if out and "SUCCESS" not in out and "成功" not in out:
+                self._append_log("[提示] 结束 PID %d：%s" % (pid, out.splitlines()[-1] if out else ""))
         except Exception as exc:
             self._append_log("[错误] 结束进程失败：%s" % exc)
 
@@ -1041,9 +1044,9 @@ class LauncherApp:
         except OSError:
             return False
 
-    def _port_occupier(self, port):
-        """返回占用端口的进程信息 (pid, name, path)；未占用或查询失败返回 None。"""
-        pid = None
+    def _port_occupier_pids(self, port):
+        """返回所有监听该端口的进程 PID 列表；无占用或查询失败返回 []。"""
+        pids = []
         try:
             r = subprocess.run(["netstat", "-ano", "-p", "tcp"],
                                capture_output=True, text=True,
@@ -1053,12 +1056,19 @@ class LauncherApp:
                 if "LISTENING" in line and needle in line:
                     parts = line.split()
                     if parts and parts[-1].isdigit():
-                        pid = int(parts[-1])
-                        break
+                        p = int(parts[-1])
+                        if p not in pids:
+                            pids.append(p)
         except Exception:
             pass
-        if pid is None:
+        return pids
+
+    def _port_occupier(self, port):
+        """返回占用端口的进程信息 (pid, name, path)；未占用或查询失败返回 None。"""
+        pids = self._port_occupier_pids(port)
+        if not pids:
             return None
+        pid = pids[0]
         name, path = "未知进程", ""
         try:
             ps = ('powershell -NoProfile -ExecutionPolicy Bypass -Command '
@@ -1073,6 +1083,16 @@ class LauncherApp:
         except Exception:
             pass
         return pid, name or "未知进程", path or ""
+
+    @staticmethod
+    def _wait_port_free(host, port, timeout=5):
+        """等待端口释放，最多 timeout 秒；释放返回 True，超时返回 False。"""
+        end = time.time() + timeout
+        while time.time() < end:
+            if not LauncherApp._port_open(host, port):
+                return True
+            time.sleep(0.3)
+        return False
 
     @staticmethod
     def _http_ready(host, port, timeout=1):
@@ -1151,6 +1171,7 @@ class LauncherApp:
         if port is None or repo is None:
             return
         if self._port_open("127.0.0.1", port):
+            pids = self._port_occupier_pids(port)
             info = self._port_occupier(port)
             if info:
                 pid, name, path = info
@@ -1160,13 +1181,20 @@ class LauncherApp:
                        "是否结束该进程并启动服务？\n"
                        "（选择“否”则取消启动）" % (port, name, pid, path or "未知"))
             else:
-                msg = ("端口 %d 似乎已被其他程序占用，仍要启动吗？" % port)
+                pid_list = "、".join(str(p) for p in pids) if pids else "未知"
+                msg = ("端口 %d 已被其他程序占用（无法识别进程名）。\n\n"
+                       "将结束占用该端口的所有进程（PID：%s）后启动服务。\n"
+                       "是否继续？\n"
+                       "（选择“否”则取消启动）" % (port, pid_list))
             if not messagebox.askyesno("端口已占用", msg):
                 return
-            if info:
-                self._append_log("正在结束占用进程 %s (PID %d)…" % (name, pid))
+            # 结束所有占用该端口的进程（尽量连带子进程树），避免旧 node 残留
+            for pid in pids:
+                self._append_log("正在结束占用进程 PID %d…" % pid)
                 self._kill_process(pid)
-                time.sleep(0.5)
+            if not self._wait_port_free("127.0.0.1", port, timeout=5):
+                self._append_log("[错误] 端口 %d 仍未释放，取消启动。" % port)
+                return
         self._save_settings()
         self._set_running(True)
         self.status_var.set("正在启动（端口 %d）…" % port)
