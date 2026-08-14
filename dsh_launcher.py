@@ -1739,11 +1739,11 @@ class LauncherApp:
                 self._append_log("[提示] 托盘图标生成失败，跳过。")
                 return
             menu = Menu(
-                MenuItem("显示宠物", lambda: self._tray_show_pet(), default=True),
-                MenuItem("打开面板", self._show_panel),
-                MenuItem("启动服务", self._on_start),
-                MenuItem("停止服务", self._on_stop),
-                MenuItem("退出程序", self._quit_app),
+                MenuItem("显示宠物", lambda: self._ui(self._tray_show_pet), default=True),
+                MenuItem("打开面板", lambda: self._ui(self._show_panel)),
+                MenuItem("启动服务", lambda: self._ui(self._on_start)),
+                MenuItem("停止服务", lambda: self._ui(self._on_stop)),
+                MenuItem("退出程序", lambda: self._ui(self._quit_app)),
             )
             icon = Icon("dsh-launcher", img, "DeepSeek Harness 启动器", menu)
             icon.run_detached()
