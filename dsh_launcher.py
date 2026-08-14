@@ -61,6 +61,43 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # 单实例互斥量名称
 MUTEX_NAME = "Local\\dsh-launcher-singleton"
 
+# Chrome 应用窗口（App Mode）快捷方式默认路径：优先用独立应用窗口打开 DSH 页面
+CHROME_APP_LNK = (r"C:\Users\zhang\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
+                  r"\Chrome 应用\DeepSeek Harness.lnk")
+
+# Chrome 应用窗口检测辅助脚本：UIAutomation 探测已打开的 App 窗口。
+# App 模式窗口类名 Chrome_WidgetWin_1，标题带应用名且不以 " - Google Chrome" 结尾
+# （普通标签窗口标题会带该后缀）。输出 "refresh" = 已找到并刷新；"open" = 未找到。
+CHROME_APP_REFRESH_PS1 = r'''
+param([string]$appTitle)
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+  Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+} catch {
+  Write-Output 'open'
+  exit 0
+}
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$cond = New-Object System.Windows.Automation.PropertyCondition(
+  [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'Chrome_WidgetWin_1')
+$windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+foreach ($w in $windows) {
+  try {
+    $name = $w.Current.Name
+    if ($name -and $name -like "*$appTitle*" -and $name -notlike '* - Google Chrome') {
+      try { $w.SetFocus() } catch {}
+      Start-Sleep -Milliseconds 300
+      [System.Windows.Forms.SendKeys]::SendWait('^r')
+      Write-Output 'refresh'
+      exit 0
+    }
+  } catch {}
+}
+Write-Output 'open'
+'''
+
 # 浏览器标签去重辅助脚本：用 UIAutomation 探测已打开的浏览器标签。
 # 输出 "refresh" = 已找到并刷新；"open" = 未找到，应新开标签。
 BROWSER_DEDUP_PS1 = r'''
@@ -858,6 +895,19 @@ class LauncherApp:
         ttk.Entry(port_frame, textvariable=self.port_var, width=12).pack(side="left", pady=8)
         ttk.Label(port_frame, text="默认 3080", style="Hint.TLabel").pack(side="left", padx=8)
 
+        # Chrome 应用窗口（启动后优先用独立应用窗口打开，留空则用默认浏览器）
+        app_frame = ttk.LabelFrame(self.root, text="打开方式")
+        app_frame.pack(fill="x", padx=12, pady=4)
+        self.chrome_app_var = tk.StringVar(value=CHROME_APP_LNK)
+        ttk.Entry(app_frame, textvariable=self.chrome_app_var).pack(
+            side="left", fill="x", expand=True, padx=(8, 4), pady=8)
+        ttk.Button(app_frame, text="浏览…", width=8, command=self._browse_chrome_app).pack(
+            side="left", padx=(0, 4))
+        ttk.Button(app_frame, text="恢复默认", width=9,
+                   command=self._reset_chrome_app).pack(side="left", padx=(0, 8))
+        ttk.Label(app_frame, text="Chrome 应用窗口(.lnk)；留空则用默认浏览器打开",
+                  style="Hint.TLabel").pack(side="left")
+
         # 选项
         opt_frame = ttk.LabelFrame(self.root, text="选项")
         opt_frame.pack(fill="x", padx=12, pady=4)
@@ -905,6 +955,8 @@ class LauncherApp:
         self.port_var.set(str(cfg.get("port") or DEFAULT_PORT))
         self.auto_open_var.set(bool(cfg.get("auto_open", True)))
         self.pet_enabled_var.set(bool(cfg.get("pet_enabled", True)))
+        # Chrome 应用窗口路径：默认内置，未配置时也用默认值（为空才表示回退浏览器）
+        self.chrome_app_var.set(cfg.get("chrome_app") if cfg.get("chrome_app") else CHROME_APP_LNK)
         if cfg.get("geometry"):
             try:
                 self.root.geometry(cfg["geometry"])
@@ -1128,6 +1180,17 @@ class LauncherApp:
         if path:
             self.repo_var.set(path)
 
+    def _browse_chrome_app(self):
+        path = filedialog.askopenfilename(
+            initialdir=os.path.dirname(CHROME_APP_LNK),
+            filetypes=[("快捷方式", "*.lnk"), ("所有文件", "*.*")],
+            title="选择 Chrome 应用窗口快捷方式")
+        if path:
+            self.chrome_app_var.set(path)
+
+    def _reset_chrome_app(self):
+        self.chrome_app_var.set(CHROME_APP_LNK)
+
     def _validate_port(self):
         port = self.port_var.get().strip()
         if not port.isdigit():
@@ -1263,7 +1326,24 @@ class LauncherApp:
 
     # ---------- 打开浏览器（避免重复标签） ----------
     def _open_browser(self, url):
-        """打开浏览器但避免重复标签：已存在该页面的标签则刷新，否则新开。"""
+        """服务就绪后打开页面：优先 Chrome 应用窗口（已打开则刷新），
+        应用不可用（未配置/文件不存在/启动失败）时回退默认浏览器标签。"""
+        # 1) Chrome 应用窗口
+        lnk = self.chrome_app_var.get().strip()
+        if lnk and os.path.isfile(lnk):
+            try:
+                if self._try_refresh_chrome_app():
+                    self._append_log("已在 Chrome 应用窗口中打开，已刷新页面。")
+                    return
+            except Exception as exc:
+                self._append_log("[提示] Chrome 应用窗口检测失败：%s" % exc)
+            try:
+                os.startfile(lnk)
+                self._append_log("已打开 Chrome 应用窗口（DeepSeek Harness）。")
+                return
+            except Exception as exc:
+                self._append_log("[提示] 打开 Chrome 应用窗口失败（%s），改用浏览器打开。" % exc)
+        # 2) 默认浏览器
         try:
             if self._try_refresh_browser_tab(url):
                 self._append_log("已在浏览器中找到该页面，已刷新标签。")
@@ -1274,6 +1354,22 @@ class LauncherApp:
             webbrowser.open(url)
         except Exception as exc:
             self._append_log("[提示] 自动打开浏览器失败：%s" % exc)
+
+    def _try_refresh_chrome_app(self):
+        """探测已打开的 Chrome 应用窗口并刷新；找到返回 True，否则 False。
+        应用名从快捷方式文件名推断（如 DeepSeek Harness.lnk -> DeepSeek Harness）。"""
+        lnk = self.chrome_app_var.get().strip()
+        title = os.path.splitext(os.path.basename(lnk))[0] or "DeepSeek Harness"
+        ps1 = os.path.join(tempfile.gettempdir(), "dsh_chrome_app_refresh.ps1")
+        with open(ps1, "w", encoding="utf-8-sig") as f:
+            f.write(CHROME_APP_REFRESH_PS1)
+        powershell = os.path.join(SYSTEM32, "WindowsPowerShell", "v1.0", "powershell.exe")
+        proc = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", ps1, "-appTitle", title],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, creationflags=CREATE_NO_WINDOW)
+        return (proc.stdout or "").strip() == "refresh"
 
     def _try_refresh_browser_tab(self, url):
         """用 UIAutomation 探测浏览器：找到目标标签则刷新并返回 True。"""
@@ -1594,6 +1690,7 @@ class LauncherApp:
         cfg["port"] = self.port_var.get().strip()
         cfg["auto_open"] = bool(self.auto_open_var.get())
         cfg["pet_enabled"] = bool(self.pet_enabled_var.get())
+        cfg["chrome_app"] = self.chrome_app_var.get().strip()
         if hasattr(self, "pet"):
             try:
                 pos = self.pet.position()
