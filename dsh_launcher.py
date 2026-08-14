@@ -256,6 +256,28 @@ def asset_path(name):
     return os.path.join(base, "assets", name)
 
 
+def make_tray_image():
+    """生成托盘图标（用宠物素材缩小；失败时画一个圆脸）。"""
+    try:
+        from PIL import Image
+        p = asset_path("pet.png")
+        if os.path.isfile(p):
+            return Image.open(p).convert("RGBA").resize((32, 32), Image.LANCZOS)
+    except Exception:
+        pass
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse([2, 8, 30, 30], fill=(240, 200, 100, 255), outline=(91, 70, 54, 255))
+        d.ellipse([10, 16, 14, 20], fill=(0, 0, 0, 255))
+        d.ellipse([18, 16, 22, 20], fill=(0, 0, 0, 255))
+        d.arc([12, 20, 20, 26], start=0, extent=180, fill=(0, 0, 0, 255))
+        return img
+    except Exception:
+        return None
+
+
 class DesktopPet:
     """常驻桌面宠物：图片形象 + 状态光环 + 待机动画 + 点击互动。
 
@@ -333,13 +355,20 @@ class DesktopPet:
         self._tick_after = self.win.after(60, self._tick)
 
     def _position_visible(self, x, y):
-        """宠物中心是否在屏幕内（防止配置了屏幕外位置导致宠物“消失”）。"""
+        """宠物图片区域是否大部分在屏幕内（防止位置在屏幕外导致宠物“消失”）。"""
         try:
             bx, by, bx1, by1 = self._screen_bounds()
             if bx1 - bx <= 0 or by1 - by <= 0:
                 bx, by, bx1, by1 = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight()
             cx, cy = x + PET_CX, y + PET_CY
-            return bx < cx < bx1 and by < cy < by1
+            if not (bx < cx < bx1 and by < cy < by1):
+                return False
+            # 图片包围盒（PET_IMG_SIZE 见方，中心 PET_CX/PET_CY）至少 85% 在屏内
+            half = PET_IMG_SIZE // 2
+            ix0, iy0, ix1, iy1 = cx - half, cy - half, cx + half, cy + half
+            vis_w = max(0, min(ix1, bx1) - max(ix0, bx))
+            vis_h = max(0, min(iy1, by1) - max(iy0, by))
+            return (vis_w * vis_h) >= (PET_IMG_SIZE * PET_IMG_SIZE) * 0.85
         except tk.TclError:
             return False
 
@@ -781,6 +810,7 @@ class LauncherApp:
         self.current_proc = None    # 更新流程当前正在运行的子进程
         self.closed = False
         self.log_queue = queue.Queue()
+        self.tray = None            # 系统托盘图标（pystray）
 
         self.cfg = load_config()
         self._build_ui()
@@ -793,6 +823,7 @@ class LauncherApp:
         self.pet_enabled_var.trace_add("write", self._on_pet_toggle)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._poll_log)
+        self._setup_tray()
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -1574,6 +1605,44 @@ class LauncherApp:
         except tk.TclError:
             pass
 
+    def _setup_tray(self):
+        """创建系统托盘图标：左键恢复宠物（默认项），右键菜单含启停/退出。"""
+        try:
+            from pystray import Icon, Menu, MenuItem
+            img = make_tray_image()
+            if img is None:
+                self._append_log("[提示] 托盘图标生成失败，跳过。")
+                return
+            menu = Menu(
+                MenuItem("显示宠物", lambda: self._tray_show_pet(), default=True),
+                MenuItem("打开面板", self._show_panel),
+                MenuItem("启动服务", self._on_start),
+                MenuItem("停止服务", self._on_stop),
+                MenuItem("退出程序", self._quit_app),
+            )
+            icon = Icon("dsh-launcher", img, "DeepSeek Harness 启动器", menu)
+            icon.run_detached()
+            self.tray = icon
+            self._append_log("系统托盘图标已就绪（左键恢复宠物）。")
+        except Exception as exc:
+            self._append_log("[提示] 托盘图标初始化失败：%s" % exc)
+
+    def _tray_show_pet(self):
+        """从托盘恢复宠物：位置无效则重置到右下角并显示。"""
+        try:
+            if not self.pet_enabled_var.get():
+                self.pet_enabled_var.set(True)
+            self.pet._undock()
+            pos = self.pet.position()
+            if pos is None or not self.pet._position_visible(pos[0], pos[1]):
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                self.pet.win.geometry("+%d+%d" % (sw - PET_W - 24, sh - PET_H - 80))
+            self.pet.show()
+            self._save_settings()
+        except Exception:
+            pass
+
     def _on_close(self):
         """关闭面板：启用宠物时隐藏到宠物（服务继续运行），否则完全退出。"""
         if self.pet_enabled_var.get():
@@ -1582,7 +1651,7 @@ class LauncherApp:
                                            "更新仍在进行，隐藏到宠物后更新将继续。确定隐藏吗？"):
                     return
             if self.proc and self.proc.poll() is None:
-                self._append_log("面板已隐藏，服务仍在运行（可右键桌面宠物操作）。")
+                self._append_log("面板已隐藏，服务仍在运行（可右键桌面宠物/托盘图标操作）。")
             self._save_settings()
             self.root.withdraw()
             return
@@ -1604,6 +1673,11 @@ class LauncherApp:
                 return
         self.closed = True
         self._save_settings()
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
         try:
             self.pet.destroy()
         except Exception:
