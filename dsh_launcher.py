@@ -807,6 +807,8 @@ class DesktopPet:
         menu.add_separator()
         menu.add_command(label="启动服务", command=app._on_start,
                          state="disabled" if (running or busy) else "normal")
+        menu.add_command(label="重启服务", command=app._on_restart,
+                         state="normal" if (running and not busy) else "disabled")
         menu.add_command(label="停止服务", command=app._on_stop,
                          state="normal" if running else "disabled")
         menu.add_separator()
