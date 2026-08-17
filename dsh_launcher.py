@@ -927,6 +927,9 @@ class LauncherApp:
         self.rebuild_btn.pack(side="left", padx=(0, 8))
         self.start_btn = ttk.Button(btn_frame, text="启动", command=self._on_start)
         self.start_btn.pack(side="left", padx=(0, 8))
+        self.restart_btn = ttk.Button(btn_frame, text="重启", command=self._on_restart,
+                                      state="disabled")
+        self.restart_btn.pack(side="left", padx=(0, 8))
         self.stop_btn = ttk.Button(btn_frame, text="停止", command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(0, 8))
         self.cancel_btn = ttk.Button(btn_frame, text="取消更新", command=self._on_cancel,
@@ -1216,6 +1219,7 @@ class LauncherApp:
         """统一刷新按钮可用状态。running：服务进程是否在运行。"""
         busy = running or self.update_active
         self.start_btn.configure(state="disabled" if busy else "normal")
+        self.restart_btn.configure(state="normal" if running else "disabled")
         self.stop_btn.configure(state="normal" if running else "disabled")
         self.update_btn.configure(state="disabled" if self.update_active else "normal")
         self.rebuild_btn.configure(state="disabled" if busy else "normal")
@@ -1421,6 +1425,47 @@ class LauncherApp:
             self._stop_service()
         self.status_var.set("已停止")
         self._set_running(False)
+
+    def _on_restart(self):
+        """重启服务：先停止当前服务，等端口释放后按相同配置重新启动。"""
+        if self.update_active:
+            messagebox.showinfo("正在更新", "更新进行中，请先等待完成或点击“取消更新”。")
+            return
+        if not (self.proc and self.proc.poll() is None):
+            messagebox.showinfo("服务未运行", "服务当前未运行，请先点击“启动”。")
+            return
+        port = self._validate_port()
+        repo = self._repo_dir()
+        if port is None or repo is None:
+            return
+        self._append_log("正在重启服务（端口 %d）…" % port)
+        self.status_var.set("正在重启（端口 %d）…" % port)
+        self._set_running(True)  # 重启期间禁用按钮，避免重复操作
+        auto_open = bool(self.auto_open_var.get())
+        threading.Thread(target=self._restart_worker, args=(repo, port, auto_open),
+                         daemon=True).start()
+
+    def _restart_worker(self, repo, port, auto_open):
+        """重启工作线程：停止旧进程 -> 等端口释放 -> 复用启动流程。"""
+        try:
+            self._stop_service()
+        except Exception:
+            pass
+        # 等待旧进程退出且端口释放（最多 8 秒）
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            proc = self.proc
+            stopped = (proc is None or proc.poll() is not None)
+            if stopped and not self._port_open("127.0.0.1", port):
+                break
+            time.sleep(0.3)
+        if self._port_open("127.0.0.1", port):
+            self._append_log("[错误] 服务已停止但端口 %d 未释放，取消重启。" % port)
+            self._ui(self.status_var.set, "重启失败")
+            self._ui(self._set_running, False)
+            return
+        self._append_log("旧服务已停止，正在启动新实例…")
+        self._start_worker(repo, port, auto_open)
 
     # ---------- 更新 ----------
     def _on_update(self):
@@ -1742,6 +1787,7 @@ class LauncherApp:
                 MenuItem("显示宠物", lambda: self._ui(self._tray_show_pet), default=True),
                 MenuItem("打开面板", lambda: self._ui(self._show_panel)),
                 MenuItem("启动服务", lambda: self._ui(self._on_start)),
+                MenuItem("重启服务", lambda: self._ui(self._on_restart)),
                 MenuItem("停止服务", lambda: self._ui(self._on_stop)),
                 MenuItem("退出程序", lambda: self._ui(self._quit_app)),
             )

@@ -137,6 +137,8 @@ except Exception:
 
 # 宠物素材（pet.png / heart.png / sad.png / ASSETS.md），打包进 exe 的 assets/ 目录
 _assets_dir = os.path.join(SPECPATH, 'assets')
+# exe 图标：用宠物图片生成的 pet.ico（多尺寸，见 assets/pet.ico）
+_icon_path = os.path.join(_assets_dir, 'pet.ico')
 
 a = Analysis(
     ['dsh_launcher.py'],
@@ -172,5 +174,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=_icon_path if os.path.isfile(_icon_path) else None,
     version=version_info,
 )
